@@ -1,10 +1,14 @@
-import rclpy, cv2, time
+import time
+import netifaces
+from socket import socket
+from threading import Thread
+
+import cv2
+import rclpy
 from rclpy.node import Node
 from flask import Flask, Response
-from socket import socket
+
 from camera_net_msgs.msg import CameraServ
-import netifaces
-from threading import Thread
 
 app = Flask(__name__)
 
@@ -37,7 +41,6 @@ def getCamera():
     gs_pipeline = "v4l2src ! video/x-raw, format=YUY2, width=640, height=480 ! v4l2convert ! video/x-raw,format=BGR ! appsink sync=false"
     
     # OpenCV Capture
-    # camera = cv2.VideoCapture(gs_pipeline, cv2.CAP_GSTREAMER)
     camera = cv2.VideoCapture(0, cv2.CAP_ANY)
     
     if not camera.isOpened():
@@ -52,9 +55,6 @@ def getCamera():
     height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
     width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
     
-    # camera.release()
-    # cv2.destroyAllWindows()
-        
 def getStream():
     while camera.isOpened():
         success, frame = camera.read()

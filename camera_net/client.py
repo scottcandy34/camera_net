@@ -1,6 +1,8 @@
 import yaml
+from threading import Thread
 
 import cv2
+from cv2.typing import MatLike
 import rclpy
 from rclpy.node import Node
 from cv_bridge import CvBridge
@@ -8,6 +10,8 @@ from sensor_msgs.msg import Image
 from sensor_msgs.msg import CameraInfo
 
 from camera_net_msgs.msg import CameraServ
+
+img: list[MatLike] = []
 
 class CameraNode(Node):
     def __init__(self):
@@ -52,20 +56,11 @@ class CameraNode(Node):
             self.camera_info.r = yaml_file['rectification_matrix']['data']
             self.camera_info.p = yaml_file['projection_matrix']['data']
 
-def main():
-    global node
-    rclpy.init()
-    node = CameraNode()
-    
-    # wait for camera communication
-    while not node.server.port:
-        rclpy.spin_once(node)
-        
+def get_stream():
+    global img
     url = f'http://{node.server.address}:{node.server.port}'
     node.get_logger().info(f'Found camera at {url}')
-    
-    # OpenCV Capture
-    br = CvBridge()
+
     capture = cv2.VideoCapture(url)
     capture.set(cv2.CAP_PROP_FPS, 30)
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 2)
@@ -81,22 +76,35 @@ def main():
 
         # Rotate Image
         rotated_frame = cv2.rotate(frame, cv2.ROTATE_180)
+
+        img.append(frame)
         
-        # Convert Image to OpenCV Image
-        img = br.cv2_to_imgmsg(rotated_frame, "bgr8")
-        
-        # Publish frame
-        node.image.publish(img)
-        
-        # Publish camera_info
-        node.camera.publish(node.camera_info)
-            
         if cv2.waitKey(0) & 0xFF == ord('q'):
             break
-        
-    # When everything is done release the capture
+    
     capture.release()
     cv2.destroyAllWindows()
+
+def main():
+    global node, img
+    rclpy.init()
+    node = CameraNode()
     
+    # wait for camera communication
+    while not node.server.port:
+        rclpy.spin_once(node)
+
+    streaming = Thread(target=get_stream)
+    streaming.start()
+
+    while True:
+        br = CvBridge()
+        if len(img) > 0:
+            img_msg = br.cv2_to_imgmsg(img.pop(0), "bgr8")
+            node.image.publish(img_msg)
+            
+            # Publish camera_info
+            node.camera.publish(node.camera_info)
+        
 if __name__ == '__main__':
     main()

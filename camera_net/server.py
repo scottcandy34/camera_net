@@ -1,8 +1,9 @@
 import time
 import os
+import signal
 import netifaces
 from socket import socket
-from threading import Thread
+from threading import Event, Lock, Thread
 
 import cv2
 import rclpy
@@ -18,6 +19,16 @@ port: int
 address: str
 height: int
 width: int
+stop = Event()
+camera = None
+opened_path = None
+latest = None
+frame_id = 0
+camera_lock = Lock()
+
+def requestStop(signum, frame):
+    stop.set()
+    os._exit(0)
 
 def getIP():
     deviceNames = netifaces.interfaces()
@@ -59,8 +70,8 @@ def captureDevices():
             other.append(path)
     return primary or other
 
-def getCamera():
-    global camera, height, width
+def openCamera():
+    global camera, height, width, opened_path
     # Compile GStreamer string
     gs_pipeline = "v4l2src ! video/x-raw, format=YUY2, width=640, height=480 ! v4l2convert ! video/x-raw,format=BGR ! appsink sync=false"
 
@@ -69,64 +80,88 @@ def getCamera():
     except Exception:
         pass
 
-    # A reload often moves the camera off /dev/video0. Open the node that works.
-    camera = cv2.VideoCapture()
-    opened_path = None
-    reported = False
-    for _ in range(20):
-        devices = captureDevices()
-        if not devices:
-            if not reported:
-                node.get_logger().warning('No camera device yet')
-                reported = True
-            time.sleep(0.5)
-            continue
-        for path in devices:
+    found = None
+    with camera_lock:
+        camera = cv2.VideoCapture()
+        for path in captureDevices():
+            if stop.is_set():
+                break
             if camera.open(path, cv2.CAP_V4L2):
+                found = path
                 opened_path = path
                 break
             camera.release()
-        if opened_path:
-            break
-        if not reported:
-            node.get_logger().warning('Camera device found but not openable yet')
-            reported = True
-        time.sleep(0.5)
+        if found:
+            codec = 0x47504A4D # MJPG
+            camera.set(cv2.CAP_PROP_FPS, 30.0)
+            camera.set(cv2.CAP_PROP_FOURCC, codec)
+            if height: camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            if width: camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
 
     try:
         cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_WARNING)
     except Exception:
         pass
+    return found
 
-    if not camera.isOpened():
-        node.get_logger().error("Cannot open camera")
-        return
+def watchCamera():
+    global latest, frame_id
+    missing_logged = False
+    had_frame = False
+    while not stop.is_set():
+        with camera_lock:
+            open_now = camera is not None and camera.isOpened()
+            cam = camera
+            path = opened_path
+        if not open_now:
+            latest = None
+            if not missing_logged:
+                if had_frame:
+                    node.get_logger().warning('Camera disconnected')
+                    had_frame = False
+                node.get_logger().warning('No camera found')
+                missing_logged = True
+            openCamera()
+            if stop.wait(0.5):
+                break
+            continue
 
-    node.get_logger().info(f'Opened camera {opened_path}')
-        
-    codec = 0x47504A4D # MJPG
-    camera.set(cv2.CAP_PROP_FPS, 30.0)
-    camera.set(cv2.CAP_PROP_FOURCC, codec)
-    
-    if height: camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    if width: camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-    
-def getStream():
-    while camera.isOpened():
-        success, frame = camera.read()
-        
+        success, frame = cam.read()
         if not success:
-            node.get_logger().warning("Failed to read frame from camera")
-            break
-        
+            with camera_lock:
+                if camera is cam and camera is not None:
+                    camera.release()
+            latest = None
+            continue
+
+        if not had_frame:
+            node.get_logger().info(f'Connected to camera {path}')
+            had_frame = True
+            missing_logged = False
+        latest = frame
+        frame_id += 1
+
+def getStream():
+    seen = -1
+    while not stop.is_set():
+        current = frame_id
+        frame = latest
+        if frame is None or current == seen:
+            if stop.wait(0.01):
+                break
+            continue
+        seen = current
+
         ret, encodedFrame = cv2.imencode('.jpg', frame)
+        if not ret:
+            continue
         imgBytes = encodedFrame.tobytes()
-        
+
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + imgBytes + b'\r\n')
-        
+
         if cv2.waitKey(1) == ord('q'):
             break
   
@@ -175,6 +210,8 @@ def startROS():
 def main(args=None):
     global port, address, node, height, width
     rclpy.init(args=args)
+    signal.signal(signal.SIGTERM, requestStop)
+    signal.signal(signal.SIGINT, requestStop)
     node = CameraNode()
     
     height = node.height
@@ -185,17 +222,19 @@ def main(args=None):
     address = getIP()
     
     # Configure Threads
-    ros = Thread(target=startROS)
-    flask = Thread(target=startFlask)
-    
-    getCamera()
-    if not camera.isOpened():
-        exit(-1)
+    ros = Thread(target=startROS, daemon=True)
+    flask = Thread(target=startFlask, daemon=True)
+    watch = Thread(target=watchCamera, daemon=True)
 
-    # Start threads
+    # Start threads. Camera search keeps going until one is found.
     ros.start()
+    watch.start()
     time.sleep(1)
     flask.start()
+
+    # Stay on the main thread so SIGTERM/SIGINT can stop the process.
+    stop.wait()
+    os._exit(0)
     
 if __name__ == '__main__':
     main()

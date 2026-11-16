@@ -1,4 +1,5 @@
 import time
+import os
 import netifaces
 from socket import socket
 from threading import Thread
@@ -35,16 +36,73 @@ def getPort() -> int:
         s.bind(('', 0))
         return s.getsockname()[1]
 
+def captureDevices():
+    primary = []
+    other = []
+    try:
+        names = os.listdir('/dev')
+    except OSError:
+        return primary
+    for name in sorted(names):
+        if not name.startswith('video') or not name[5:].isdigit():
+            continue
+        path = f'/dev/{name}'
+        index_file = f'/sys/class/video4linux/{name}/index'
+        try:
+            with open(index_file) as handle:
+                node_index = handle.read().strip()
+        except OSError:
+            node_index = '0'
+        if node_index == '0':
+            primary.append(path)
+        else:
+            other.append(path)
+    return primary or other
+
 def getCamera():
     global camera, height, width
     # Compile GStreamer string
     gs_pipeline = "v4l2src ! video/x-raw, format=YUY2, width=640, height=480 ! v4l2convert ! video/x-raw,format=BGR ! appsink sync=false"
-    
-    # OpenCV Capture
-    camera = cv2.VideoCapture(0, cv2.CAP_ANY)
-    
+
+    try:
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+    except Exception:
+        pass
+
+    # A reload often moves the camera off /dev/video0. Open the node that works.
+    camera = cv2.VideoCapture()
+    opened_path = None
+    reported = False
+    for _ in range(20):
+        devices = captureDevices()
+        if not devices:
+            if not reported:
+                node.get_logger().warning('No camera device yet')
+                reported = True
+            time.sleep(0.5)
+            continue
+        for path in devices:
+            if camera.open(path, cv2.CAP_V4L2):
+                opened_path = path
+                break
+            camera.release()
+        if opened_path:
+            break
+        if not reported:
+            node.get_logger().warning('Camera device found but not openable yet')
+            reported = True
+        time.sleep(0.5)
+
+    try:
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_WARNING)
+    except Exception:
+        pass
+
     if not camera.isOpened():
         node.get_logger().error("Cannot open camera")
+        return
+
+    node.get_logger().info(f'Opened camera {opened_path}')
         
     codec = 0x47504A4D # MJPG
     camera.set(cv2.CAP_PROP_FPS, 30.0)

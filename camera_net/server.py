@@ -19,6 +19,8 @@ port: int
 address: str
 height: int
 width: int
+jpeg_quality: int = 60
+target_fps: float = 15.0
 stop = Event()
 camera = None
 opened_path = None
@@ -93,7 +95,7 @@ def openCamera():
             camera.release()
         if found:
             codec = 0x47504A4D # MJPG
-            camera.set(cv2.CAP_PROP_FPS, 30.0)
+            camera.set(cv2.CAP_PROP_FPS, float(target_fps))
             camera.set(cv2.CAP_PROP_FOURCC, codec)
             if height: camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             if width: camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -110,6 +112,8 @@ def watchCamera():
     global latest, frame_id
     missing_logged = False
     had_frame = False
+    min_interval = 1.0 / max(float(target_fps), 1.0)
+    last = 0.0
     while not stop.is_set():
         with camera_lock:
             open_now = camera is not None and camera.isOpened()
@@ -128,6 +132,12 @@ def watchCamera():
                 break
             continue
 
+        now = time.monotonic()
+        if now - last < min_interval:
+            if stop.wait(0.005):
+                break
+            continue
+
         success, frame = cam.read()
         if not success:
             with camera_lock:
@@ -136,6 +146,7 @@ def watchCamera():
             latest = None
             continue
 
+        last = now
         if not had_frame:
             node.get_logger().info(f'Connected to camera {path}')
             had_frame = True
@@ -154,7 +165,7 @@ def getStream():
             continue
         seen = current
 
-        ret, encodedFrame = cv2.imencode('.jpg', frame)
+        ret, encodedFrame = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
         if not ret:
             continue
         imgBytes = encodedFrame.tobytes()
@@ -181,16 +192,20 @@ class CameraNode(Node):
         # Parameters
         self.declare_parameter('height', 480)
         self.declare_parameter('width', 640)
+        self.declare_parameter('jpeg_quality', 60)
+        self.declare_parameter('fps', 15.0)
         
         # Get Parameters
         self.height = self.get_parameter_or('height').get_parameter_value().integer_value
         self.width = self.get_parameter_or('width').get_parameter_value().integer_value
+        self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
+        self.fps = float(self.get_parameter('fps').value)
         
         # Publishers
         self.image = self.create_publisher(CameraServ, 'camera_server', 10)
         
         # Timer loops
-        self.create_timer(0.1, self._actions)
+        self.create_timer(1.0, self._actions)
     
     def _actions(self):
         msg = CameraServ()
@@ -208,7 +223,7 @@ def startROS():
     node.get_logger().error('ROS stopped running')
 
 def main(args=None):
-    global port, address, node, height, width
+    global port, address, node, height, width, jpeg_quality, target_fps
     rclpy.init(args=args)
     signal.signal(signal.SIGTERM, requestStop)
     signal.signal(signal.SIGINT, requestStop)
@@ -216,6 +231,8 @@ def main(args=None):
     
     height = node.height
     width = node.width
+    jpeg_quality = node.jpeg_quality
+    target_fps = node.fps
 
     # Set ip addr and port #
     port = getPort()

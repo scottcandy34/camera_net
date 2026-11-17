@@ -24,8 +24,10 @@ target_fps: float = 15.0
 stop = Event()
 camera = None
 opened_path = None
-latest = None
+latest_jpeg = None
 frame_id = 0
+frame_kind = 'encoded'
+use_gstreamer = True
 camera_lock = Lock()
 
 def requestStop(signum, frame):
@@ -72,10 +74,55 @@ def captureDevices():
             other.append(path)
     return primary or other
 
+def jpegBytes(frame):
+    if frame is None:
+        return None
+    raw = frame.tobytes()
+    if len(raw) < 4 or raw[0] != 0xFF or raw[1] != 0xD8:
+        return None
+    end = raw.rfind(b'\xff\xd9')
+    if end == -1:
+        return raw
+    return raw[:end + 2]
+
+def applyCapture(cap):
+    global height, width
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+    cap.set(cv2.CAP_PROP_FOURCC, 0x47504A4D) # MJPG
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+    cap.set(cv2.CAP_PROP_FPS, float(target_fps))
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    try:
+        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
+    except Exception:
+        pass
+    got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or int(width)
+    got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or int(height)
+    width = got_w
+    height = got_h
+
+def openGStreamer(path):
+    pipeline = (
+        f"v4l2src device={path} ! "
+        f"image/jpeg,width={int(width)},height={int(height)},framerate={int(target_fps)}/1 ! "
+        f"appsink drop=1 max-buffers=1 sync=false"
+    )
+    cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+    if not cap.isOpened():
+        cap.release()
+        return None
+    ok, frame = cap.read()
+    if not ok or jpegBytes(frame) is None:
+        cap.release()
+        return None
+    got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or int(width)
+    got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or int(height)
+    return cap, got_w, got_h
+
 def openCamera():
-    global camera, height, width, opened_path
-    # Compile GStreamer string
-    gs_pipeline = "v4l2src ! video/x-raw, format=YUY2, width=640, height=480 ! v4l2convert ! video/x-raw,format=BGR ! appsink sync=false"
+    global camera, height, width, opened_path, use_gstreamer
 
     try:
         cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
@@ -83,24 +130,36 @@ def openCamera():
         pass
 
     found = None
+    chosen = None
+    for path in captureDevices():
+        if stop.is_set():
+            break
+        if use_gstreamer:
+            opened = openGStreamer(path)
+            if opened is None:
+                use_gstreamer = False
+            else:
+                cap, got_w, got_h = opened
+                chosen = (cap, path, got_w, got_h)
+                break
+        cap = cv2.VideoCapture(path, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        applyCapture(cap)
+        chosen = (cap, path, width, height)
+        break
+
     with camera_lock:
-        camera = cv2.VideoCapture()
-        for path in captureDevices():
-            if stop.is_set():
-                break
-            if camera.open(path, cv2.CAP_V4L2):
-                found = path
-                opened_path = path
-                break
-            camera.release()
-        if found:
-            codec = 0x47504A4D # MJPG
-            camera.set(cv2.CAP_PROP_FPS, float(target_fps))
-            camera.set(cv2.CAP_PROP_FOURCC, codec)
-            if height: camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            if width: camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+        if chosen is None:
+            camera = None
+        else:
+            cap, path, got_w, got_h = chosen
+            camera = cap
+            opened_path = path
+            width = got_w
+            height = got_h
+            found = path
 
     try:
         cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_WARNING)
@@ -108,8 +167,35 @@ def openCamera():
         pass
     return found
 
+def jpegSize(data):
+    i = 2
+    n = len(data)
+    while i + 9 < n:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker in (0xC0, 0xC1, 0xC2):
+            h = int.from_bytes(data[i + 5:i + 7], 'big')
+            w = int.from_bytes(data[i + 7:i + 9], 'big')
+            if w and h:
+                return w, h
+            return None
+        if marker == 0xD8:
+            i += 2
+            continue
+        if marker in (0xD9, 0xDA):
+            return None
+        if i + 4 > n:
+            return None
+        seg = int.from_bytes(data[i + 2:i + 4], 'big')
+        if seg < 2:
+            return None
+        i += 2 + seg
+    return None
+
 def watchCamera():
-    global latest, frame_id
+    global latest_jpeg, frame_id, frame_kind, width, height
     missing_logged = False
     had_frame = False
     min_interval = 1.0 / max(float(target_fps), 1.0)
@@ -120,7 +206,7 @@ def watchCamera():
             cam = camera
             path = opened_path
         if not open_now:
-            latest = None
+            latest_jpeg = None
             if not missing_logged:
                 if had_frame:
                     node.get_logger().warning('Camera disconnected')
@@ -143,45 +229,76 @@ def watchCamera():
             with camera_lock:
                 if camera is cam and camera is not None:
                     camera.release()
-            latest = None
+            latest_jpeg = None
             continue
+
+        jpeg = jpegBytes(frame)
+        if jpeg is None:
+            ret, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
+            if not ret:
+                continue
+            jpeg = encoded.tobytes()
+            kind = 'encoded'
+        else:
+            kind = 'jpeg'
 
         last = now
         if not had_frame:
-            node.get_logger().info(f'Connected to camera {path}')
+            if kind == 'jpeg':
+                size = jpegSize(jpeg)
+                if size:
+                    width, height = size
+            frame_kind = kind
+            node.get_logger().info(f'Connected to camera {path} {int(width)}x{int(height)} {kind}')
             had_frame = True
             missing_logged = False
-        latest = frame
+        latest_jpeg = jpeg
         frame_id += 1
+
+def guardCamera():
+    last_id = -1
+    last_change = time.monotonic()
+    while not stop.is_set():
+        if stop.wait(0.25):
+            break
+        with camera_lock:
+            open_now = camera is not None and camera.isOpened()
+            cam = camera
+        if not open_now:
+            last_id = frame_id
+            last_change = time.monotonic()
+            continue
+        if frame_id != last_id:
+            last_id = frame_id
+            last_change = time.monotonic()
+            continue
+        if time.monotonic() - last_change < 2.0:
+            continue
+        with camera_lock:
+            if camera is cam and camera is not None:
+                camera.release()
+        last_change = time.monotonic()
 
 def getStream():
     seen = -1
     while not stop.is_set():
         current = frame_id
-        frame = latest
-        if frame is None or current == seen:
+        jpeg = latest_jpeg
+        if jpeg is None or current == seen:
             if stop.wait(0.01):
                 break
             continue
         seen = current
 
-        ret, encodedFrame = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
-        if not ret:
-            continue
-        imgBytes = encodedFrame.tobytes()
-
         yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + imgBytes + b'\r\n')
-
-        if cv2.waitKey(1) == ord('q'):
-            break
+               b'Content-Type: image/jpeg\r\n\r\n' + jpeg + b'\r\n')
   
 @app.route('/')
 def video_stream():
     return Response(getStream(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def startFlask():
-    app.run(port=port, host=address)
+    app.run(port=port, host='0.0.0.0', threaded=True, use_reloader=False)
     node.get_logger().error('Flask stopped running')
     
 class CameraNode(Node):
@@ -211,8 +328,8 @@ class CameraNode(Node):
         msg = CameraServ()
         msg.address = address
         msg.port = port
-        msg.height = self.height
-        msg.width = self.width
+        msg.height = int(height)
+        msg.width = int(width)
         
         self.image.publish(msg)
 
@@ -242,10 +359,12 @@ def main(args=None):
     ros = Thread(target=startROS, daemon=True)
     flask = Thread(target=startFlask, daemon=True)
     watch = Thread(target=watchCamera, daemon=True)
+    guard = Thread(target=guardCamera, daemon=True)
 
     # Start threads. Camera search keeps going until one is found.
     ros.start()
     watch.start()
+    guard.start()
     time.sleep(1)
     flask.start()
 

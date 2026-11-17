@@ -1,11 +1,12 @@
 import os
 os.environ['OPENCV_FFMPEG_LOGLEVEL'] = '-8'
+os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'fflags;nobuffer|flags;low_delay|max_delay;0|probesize;32|analyzeduration;0'
 
 import time
 import signal
 import yaml
 from socket import create_connection
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 
 import cv2
 from cv2.typing import MatLike
@@ -18,6 +19,7 @@ from sensor_msgs.msg import CameraInfo
 from camera_net_msgs.msg import CameraServ
 
 img: list[MatLike] = []
+img_lock = Lock()
 stop = Event()
 
 def requestStop(signum, frame):
@@ -120,7 +122,7 @@ def get_stream():
             capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
             capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
             capture.set(cv2.CAP_PROP_FPS, 30)
-            capture.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
             if not capture.isOpened():
                 capture.release()
@@ -151,7 +153,9 @@ def get_stream():
         # Rotate Image
         rotated_frame = cv2.rotate(frame, cv2.ROTATE_180)
 
-        img.append(frame)
+        with img_lock:
+            img.clear()
+            img.append(rotated_frame)
 
     if capture is not None:
         capture.release()
@@ -174,13 +178,20 @@ def main():
     br = CvBridge()
     try:
         while not stop.is_set() and rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=0.1)
-            if len(img) > 0:
-                img_msg = br.cv2_to_imgmsg(img.pop(0), "bgr8")
-                node.image.publish(img_msg)
-                
-                # Publish camera_info
-                node.camera.publish(node.camera_info)
+            rclpy.spin_once(node, timeout_sec=0.001)
+            with img_lock:
+                if len(img) == 0:
+                    frame = None
+                else:
+                    frame = img.pop()
+                    img.clear()
+            if frame is None:
+                continue
+            img_msg = br.cv2_to_imgmsg(frame, "bgr8")
+            node.image.publish(img_msg)
+            
+            # Publish camera_info
+            node.camera.publish(node.camera_info)
     except KeyboardInterrupt:
         stop.set()
     os._exit(0)

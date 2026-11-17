@@ -15,6 +15,7 @@ from rclpy.node import Node
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import CameraInfo
+from sensor_msgs.msg import CompressedImage
 
 from camera_net_msgs.msg import CameraServ
 
@@ -35,21 +36,29 @@ class CameraNode(Node):
         self.declare_parameter('camera', 'camera_server')
         self.declare_parameter('image', 'image_raw')
         self.declare_parameter('camera_info_url', '')
+        self.declare_parameter('publish_raw', True)
+        self.declare_parameter('publish_compressed', True)
+        self.declare_parameter('max_fps', 15.0)
         
         # Get Parameters
         self.camera_param = self.get_parameter_or('camera').get_parameter_value().string_value
         self.image_param = self.get_parameter_or('image').get_parameter_value().string_value
         self.camera_info_url = self.get_parameter_or('camera_info_url').get_parameter_value().string_value
+        self.publish_raw = bool(self.get_parameter('publish_raw').value)
+        self.publish_compressed = bool(self.get_parameter('publish_compressed').value)
+        self.max_fps = float(self.get_parameter('max_fps').value)
         
         # Subscriptions
         self.create_subscription(CameraServ, self.camera_param, self._camera, 10)
         
         # Publishers
-        self.image = self.create_publisher(Image, self.image_param, 30)
-        self.camera = self.create_publisher(CameraInfo, 'camera_info', 30)
+        self.image = self.create_publisher(Image, self.image_param, 5) if self.publish_raw else None
+        self.compressed = self.create_publisher(CompressedImage, self.image_param + '/compressed', 5) if self.publish_compressed else None
+        self.camera = self.create_publisher(CameraInfo, 'camera_info', 5)
         
         self.camera_info = CameraInfo()
         self.server = CameraServ()
+        self.bridge = CvBridge()
         
     def _camera(self, msg: CameraServ):
         self.server = msg
@@ -175,10 +184,15 @@ def main():
     streaming = Thread(target=get_stream, daemon=True)
     streaming.start()
 
-    br = CvBridge()
+    br = node.bridge
+    min_interval = 1.0 / max(node.max_fps, 1.0)
+    last = 0.0
     try:
         while not stop.is_set() and rclpy.ok():
             rclpy.spin_once(node, timeout_sec=0.001)
+            now = time.monotonic()
+            if now - last < min_interval:
+                continue
             with img_lock:
                 if len(img) == 0:
                     frame = None
@@ -187,10 +201,25 @@ def main():
                     img.clear()
             if frame is None:
                 continue
-            img_msg = br.cv2_to_imgmsg(frame, "bgr8")
-            node.image.publish(img_msg)
+            last = now
+            stamp = node.get_clock().now().to_msg()
+
+            if node.image is not None:
+                img_msg = br.cv2_to_imgmsg(frame, "bgr8")
+                img_msg.header.stamp = stamp
+                node.image.publish(img_msg)
+
+            if node.compressed is not None:
+                ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                if ok:
+                    cmsg = CompressedImage()
+                    cmsg.header.stamp = stamp
+                    cmsg.format = 'jpeg'
+                    cmsg.data = buf.tobytes()
+                    node.compressed.publish(cmsg)
             
             # Publish camera_info
+            node.camera_info.header.stamp = stamp
             node.camera.publish(node.camera_info)
     except KeyboardInterrupt:
         stop.set()

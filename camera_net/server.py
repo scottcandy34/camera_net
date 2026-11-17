@@ -26,6 +26,9 @@ camera = None
 opened_path = None
 latest_jpeg = None
 frame_id = 0
+reads_ok = 0
+in_read = False
+dropped = False
 frame_kind = 'encoded'
 use_gstreamer = True
 camera_lock = Lock()
@@ -195,9 +198,11 @@ def jpegSize(data):
     return None
 
 def watchCamera():
-    global latest_jpeg, frame_id, frame_kind, width, height
+    global latest_jpeg, frame_id, frame_kind, width, height, camera, reads_ok, in_read, dropped
     missing_logged = False
     had_frame = False
+    misses = 0
+    fail_since = 0.0
     min_interval = 1.0 / max(float(target_fps), 1.0)
     last = 0.0
     while not stop.is_set():
@@ -214,23 +219,52 @@ def watchCamera():
                 node.get_logger().warning('No camera found')
                 missing_logged = True
             openCamera()
+            misses = 0
             if stop.wait(0.5):
                 break
             continue
 
-        now = time.monotonic()
-        if now - last < min_interval:
-            if stop.wait(0.005):
-                break
+        with camera_lock:
+            in_read = True
+        success, frame = cam.read()
+        with camera_lock:
+            in_read = False
+            was_dropped = dropped
+            if was_dropped:
+                dropped = False
+                camera = None
+        if was_dropped:
+            latest_jpeg = None
+            misses = 0
+            fail_since = 0.0
             continue
 
-        success, frame = cam.read()
         if not success:
+            if not had_frame:
+                if stop.wait(0.2):
+                    break
+                continue
+            if fail_since == 0.0:
+                fail_since = time.monotonic()
+            if time.monotonic() - fail_since < 10.0:
+                if stop.wait(0.05):
+                    break
+                continue
             with camera_lock:
                 if camera is cam and camera is not None:
                     camera.release()
             latest_jpeg = None
+            misses = 0
+            fail_since = 0.0
             continue
+
+        misses = 0
+        fail_since = 0.0
+        reads_ok += 1
+        now = time.monotonic()
+        if now - last < min_interval:
+            continue
+        last = now
 
         jpeg = jpegBytes(frame)
         if jpeg is None:
@@ -256,7 +290,8 @@ def watchCamera():
         frame_id += 1
 
 def guardCamera():
-    last_id = -1
+    global dropped
+    last_reads = -1
     last_change = time.monotonic()
     while not stop.is_set():
         if stop.wait(0.25):
@@ -264,19 +299,22 @@ def guardCamera():
         with camera_lock:
             open_now = camera is not None and camera.isOpened()
             cam = camera
-        if not open_now:
-            last_id = frame_id
+            busy = in_read
+            count = reads_ok
+        if not open_now or not busy or count == 0:
+            last_reads = count
             last_change = time.monotonic()
             continue
-        if frame_id != last_id:
-            last_id = frame_id
+        if count != last_reads:
+            last_reads = count
             last_change = time.monotonic()
             continue
-        if time.monotonic() - last_change < 2.0:
+        if time.monotonic() - last_change < 10.0:
             continue
         with camera_lock:
-            if camera is cam and camera is not None:
+            if camera is cam and camera is not None and in_read and not dropped:
                 camera.release()
+                dropped = True
         last_change = time.monotonic()
 
 def getStream():

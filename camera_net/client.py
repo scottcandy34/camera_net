@@ -24,7 +24,7 @@ img: list[MatLike] = []
 img_lock = Lock()
 stop = Event()
 image_qos = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
+    reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
     depth=1,
     durability=DurabilityPolicy.VOLATILE,
@@ -43,8 +43,8 @@ class CameraNode(Node):
         self.declare_parameter('camera', 'camera_server')
         self.declare_parameter('image', 'image_raw')
         self.declare_parameter('camera_info_url', '')
-        self.declare_parameter('publish_raw', False)
-        self.declare_parameter('publish_compressed', True)
+        self.declare_parameter('publish_raw', True)
+        self.declare_parameter('publish_compressed', False)
         self.declare_parameter('max_fps', 15.0)
         
         # Get Parameters

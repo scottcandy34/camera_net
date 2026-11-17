@@ -12,6 +12,7 @@ import cv2
 from cv2.typing import MatLike
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import CameraInfo
@@ -22,6 +23,12 @@ from camera_net_msgs.msg import CameraServ
 img: list[MatLike] = []
 img_lock = Lock()
 stop = Event()
+image_qos = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+    durability=DurabilityPolicy.VOLATILE,
+)
 
 def requestStop(signum, frame):
     stop.set()
@@ -36,7 +43,7 @@ class CameraNode(Node):
         self.declare_parameter('camera', 'camera_server')
         self.declare_parameter('image', 'image_raw')
         self.declare_parameter('camera_info_url', '')
-        self.declare_parameter('publish_raw', True)
+        self.declare_parameter('publish_raw', False)
         self.declare_parameter('publish_compressed', True)
         self.declare_parameter('max_fps', 15.0)
         
@@ -52,24 +59,32 @@ class CameraNode(Node):
         self.create_subscription(CameraServ, self.camera_param, self._camera, 10)
         
         # Publishers
-        self.image = self.create_publisher(Image, self.image_param, 5) if self.publish_raw else None
-        self.compressed = self.create_publisher(CompressedImage, self.image_param + '/compressed', 5) if self.publish_compressed else None
-        self.camera = self.create_publisher(CameraInfo, 'camera_info', 5)
+        self.image = self.create_publisher(Image, self.image_param, image_qos) if self.publish_raw else None
+        self.compressed = self.create_publisher(CompressedImage, self.image_param + '/compressed', image_qos) if self.publish_compressed else None
+        self.camera = self.create_publisher(CameraInfo, 'camera_info', 1)
         
         self.camera_info = CameraInfo()
         self.server = CameraServ()
         self.bridge = CvBridge()
+        self.loaded_url = None
+        self.info_dirty = True
         
     def _camera(self, msg: CameraServ):
         self.server = msg
-        self.camera_info.height = msg.height
-        self.camera_info.width = msg.width
+        if self.camera_info.height != msg.height or self.camera_info.width != msg.width:
+            self.camera_info.height = msg.height
+            self.camera_info.width = msg.width
+            self.info_dirty = True
         self.getCalibrationFile()
 
     def getCalibrationFile(self):
-        if self.camera_info_url:
-            node.get_logger().info('Loading Camera Calibration')
-            with open(self.camera_info_url, 'r') as file:
+        url = self.camera_info_url
+        if not url or url == self.loaded_url:
+            return
+        self.loaded_url = url
+        self.get_logger().info('Loading Camera Calibration')
+        try:
+            with open(url, 'r') as file:
                 yaml_file = yaml.safe_load(file)
                 
             self.camera_info.distortion_model = yaml_file['distortion_model']
@@ -77,6 +92,9 @@ class CameraNode(Node):
             self.camera_info.k = yaml_file['camera_matrix']['data']
             self.camera_info.r = yaml_file['rectification_matrix']['data']
             self.camera_info.p = yaml_file['projection_matrix']['data']
+            self.info_dirty = True
+        except Exception as e:
+            self.get_logger().error(f'Failed to load calibration: {e}')
 
 def portOpen(url):
     # http://host:port
@@ -129,7 +147,7 @@ def get_stream():
             url = next_url
             capture = cv2.VideoCapture(url)
             capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
-            capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+            capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 1000)
             capture.set(cv2.CAP_PROP_FPS, 30)
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
@@ -187,6 +205,7 @@ def main():
     br = node.bridge
     min_interval = 1.0 / max(node.max_fps, 1.0)
     last = 0.0
+    last_info = 0.0
     try:
         while not stop.is_set() and rclpy.ok():
             rclpy.spin_once(node, timeout_sec=0.001)
@@ -217,10 +236,12 @@ def main():
                     cmsg.format = 'jpeg'
                     cmsg.data = buf.tobytes()
                     node.compressed.publish(cmsg)
-            
-            # Publish camera_info
-            node.camera_info.header.stamp = stamp
-            node.camera.publish(node.camera_info)
+
+            if node.info_dirty or now - last_info >= 1.0:
+                node.camera_info.header.stamp = stamp
+                node.camera.publish(node.camera_info)
+                node.info_dirty = False
+                last_info = now
     except KeyboardInterrupt:
         stop.set()
     os._exit(0)

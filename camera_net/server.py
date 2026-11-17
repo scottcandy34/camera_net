@@ -30,8 +30,42 @@ reads_ok = 0
 in_read = False
 dropped = False
 frame_kind = 'encoded'
-use_gstreamer = True
+use_gstreamer = False
 camera_lock = Lock()
+failed_until = {}
+last_reset = {}
+reset_logged = False
+
+def usbDevice(video):
+    name = os.path.basename(video)
+    return os.path.dirname(os.path.realpath(f'/sys/class/video4linux/{name}/device'))
+
+def resetUsb(video):
+    global reset_logged
+    if not video:
+        return False
+    try:
+        dev = usbDevice(video)
+    except OSError:
+        return False
+    now = time.monotonic()
+    if now - last_reset.get(dev, 0) < 30.0:
+        return False
+    auth = os.path.join(dev, 'authorized')
+    try:
+        with open(auth, 'w') as handle:
+            handle.write('0\n')
+        time.sleep(0.4)
+        with open(auth, 'w') as handle:
+            handle.write('1\n')
+    except OSError as err:
+        if not reset_logged:
+            node.get_logger().error(f'USB reset failed for {video}: {err}')
+            reset_logged = True
+        return False
+    last_reset[dev] = now
+    node.get_logger().warning(f'Reset USB camera {video}')
+    return True
 
 def requestStop(signum, frame):
     stop.set()
@@ -90,17 +124,10 @@ def jpegBytes(frame):
 
 def applyCapture(cap):
     global height, width
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
     cap.set(cv2.CAP_PROP_FOURCC, 0x47504A4D) # MJPG
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
-    cap.set(cv2.CAP_PROP_FPS, float(target_fps))
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    try:
-        cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
-    except Exception:
-        pass
     got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or int(width)
     got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or int(height)
     width = got_w
@@ -134,9 +161,12 @@ def openCamera():
 
     found = None
     chosen = None
+    now = time.monotonic()
     for path in captureDevices():
         if stop.is_set():
             break
+        if failed_until.get(path, 0) > now:
+            continue
         if use_gstreamer:
             opened = openGStreamer(path)
             if opened is None:
@@ -165,7 +195,7 @@ def openCamera():
             found = path
 
     try:
-        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_WARNING)
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
     except Exception:
         pass
     return found
@@ -241,6 +271,13 @@ def watchCamera():
 
         if not success:
             if not had_frame:
+                with camera_lock:
+                    if camera is cam and camera is not None:
+                        camera.release()
+                        camera = None
+                latest_jpeg = None
+                resetUsb(path)
+                failed_until[path] = time.monotonic() + 5.0
                 if stop.wait(0.2):
                     break
                 continue
@@ -253,7 +290,10 @@ def watchCamera():
             with camera_lock:
                 if camera is cam and camera is not None:
                     camera.release()
+                    camera = None
             latest_jpeg = None
+            resetUsb(path)
+            failed_until[path] = time.monotonic() + 5.0
             misses = 0
             fail_since = 0.0
             continue

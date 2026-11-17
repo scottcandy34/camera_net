@@ -1,5 +1,11 @@
+import os
+os.environ['OPENCV_FFMPEG_LOGLEVEL'] = '-8'
+
+import time
+import signal
 import yaml
-from threading import Thread
+from socket import create_connection
+from threading import Event, Thread
 
 import cv2
 from cv2.typing import MatLike
@@ -12,6 +18,11 @@ from sensor_msgs.msg import CameraInfo
 from camera_net_msgs.msg import CameraServ
 
 img: list[MatLike] = []
+stop = Event()
+
+def requestStop(signum, frame):
+    stop.set()
+    os._exit(0)
 
 class CameraNode(Node):
     def __init__(self):
@@ -56,55 +67,123 @@ class CameraNode(Node):
             self.camera_info.r = yaml_file['rectification_matrix']['data']
             self.camera_info.p = yaml_file['projection_matrix']['data']
 
+def portOpen(url):
+    # http://host:port
+    host_port = url.split('://', 1)[-1]
+    host, port = host_port.rsplit(':', 1)
+    try:
+        with create_connection((host, int(port)), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
 def get_stream():
     global img
-    url = f'http://{node.server.address}:{node.server.port}'
-    node.get_logger().info(f'Found camera at {url}')
+    capture = None
+    url = None
+    connected = False
 
-    capture = cv2.VideoCapture(url)
-    capture.set(cv2.CAP_PROP_FPS, 30)
-    capture.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-    capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G') )
+    try:
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+    except Exception:
+        pass
 
-    while capture.isOpened():
+    while not stop.is_set() and rclpy.ok():
+        server = node.server
+        if not server.port:
+            if capture is not None:
+                capture.release()
+                capture = None
+                url = None
+            if connected:
+                node.get_logger().warning('Camera disconnected')
+                connected = False
+            if stop.wait(0.5):
+                break
+            continue
+
+        next_url = f'http://{server.address}:{server.port}'
+        if capture is None or not capture.isOpened() or next_url != url:
+            if connected:
+                node.get_logger().warning('Camera disconnected')
+                connected = False
+            if capture is not None:
+                capture.release()
+                capture = None
+            if not portOpen(next_url):
+                url = None
+                if stop.wait(0.5):
+                    break
+                continue
+            url = next_url
+            capture = cv2.VideoCapture(url)
+            capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+            capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+            capture.set(cv2.CAP_PROP_FPS, 30)
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+            capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+            if not capture.isOpened():
+                capture.release()
+                capture = None
+                url = None
+                if stop.wait(0.5):
+                    break
+                continue
+
         success, frame = capture.read()
 
         # if frame is not read correctly ret is True
         if not success:
-            node.get_logger().error('Can\'t receive frame (stream end?). Exiting ...')
-            break
+            if connected:
+                node.get_logger().warning('Camera disconnected')
+                connected = False
+            capture.release()
+            capture = None
+            url = None
+            if stop.wait(0.5):
+                break
+            continue
+
+        if not connected:
+            node.get_logger().info(f'Connected to camera {url}')
+            connected = True
 
         # Rotate Image
         rotated_frame = cv2.rotate(frame, cv2.ROTATE_180)
 
         img.append(frame)
-        
-        if cv2.waitKey(0) & 0xFF == ord('q'):
-            break
-    
-    capture.release()
+
+    if capture is not None:
+        capture.release()
     cv2.destroyAllWindows()
 
 def main():
     global node, img
     rclpy.init()
+    signal.signal(signal.SIGINT, requestStop)
+    signal.signal(signal.SIGTERM, requestStop)
     node = CameraNode()
     
     # wait for camera communication
-    while not node.server.port:
-        rclpy.spin_once(node)
+    while not stop.is_set() and rclpy.ok() and not node.server.port:
+        rclpy.spin_once(node, timeout_sec=0.1)
 
-    streaming = Thread(target=get_stream)
+    streaming = Thread(target=get_stream, daemon=True)
     streaming.start()
 
-    while True:
-        br = CvBridge()
-        if len(img) > 0:
-            img_msg = br.cv2_to_imgmsg(img.pop(0), "bgr8")
-            node.image.publish(img_msg)
-            
-            # Publish camera_info
-            node.camera.publish(node.camera_info)
+    br = CvBridge()
+    try:
+        while not stop.is_set() and rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.1)
+            if len(img) > 0:
+                img_msg = br.cv2_to_imgmsg(img.pop(0), "bgr8")
+                node.image.publish(img_msg)
+                
+                # Publish camera_info
+                node.camera.publish(node.camera_info)
+    except KeyboardInterrupt:
+        stop.set()
+    os._exit(0)
         
 if __name__ == '__main__':
     main()
